@@ -1,0 +1,110 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: false
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # OpenWrt 17.01 (LEDE) - mipsel 24kc
+          - arch: mipsel-openwrt-linux-musl
+            sdk_url: https://downloads.openwrt.org/releases/17.01.7/targets/ramips/mt7621/lede-sdk-17.01.7-ramips-mt7621.Linux-x86_64.tar.xz
+            name: openwrt-mipsel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download OpenWrt SDK
+        run: |
+          wget -q "${{ matrix.sdk_url }}" -O sdk.tar.xz
+          tar xf sdk.tar.xz
+          SDK_DIR=$(ls -d lede-sdk-* | head -1)
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
+      - name: Compile
+        run: |
+          SDK_DIR="${{ env.SDK_DIR }}"
+          TOOLCHAIN=$(ls -d ${SDK_DIR}/staging_dir/toolchain-*/bin/*-openwrt-linux-musl- 2>/dev/null | head -1)
+          echo "Toolchain: ${TOOLCHAIN}"
+          make CROSS_COMPILE="${TOOLCHAIN}" clean
+          make CROSS_COMPILE="${TOOLCHAIN}"
+          ${TOOLCHAIN}strip multicast_proxy
+          file multicast_proxy
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          [ -z "$VERSION" ] && VERSION="${{ github.event.inputs.version }}"
+          [ -z "$VERSION" ] && VERSION="dev"
+
+          tar czf multicast_proxy-${VERSION}-${{ matrix.name }}.tar.gz \
+            multicast_proxy \
+            multicast_proxy.init \
+            multicast_proxy.uci \
+            README.md
+
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: multicast_proxy-${{ matrix.name }}
+          path: multicast_proxy-*.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            multicast_proxy-*/multicast_proxy-*.tar.gz
+          body: |
+            ## Multicast Proxy
+
+            All-in-One IPTV proxy for OpenWrt — 替代 igmpproxy + udpxy。
+
+            ### 安装
+
+            ```bash
+            # 解压
+            tar xzf multicast_proxy-openwrt-mipsel.tar.gz
+
+            # 复制到路由器
+            scp multicast_proxy root@<router_ip>:/usr/bin/
+            scp multicast_proxy.init root@<router_ip>:/etc/init.d/multicast_proxy
+            scp multicast_proxy.uci root@<router_ip>:/etc/config/multicast_proxy
+
+            # 启用
+            ssh root@<router_ip> "chmod +x /usr/bin/multicast_proxy /etc/init.d/multicast_proxy"
+            ssh root@<router_ip> "/etc/init.d/multicast_proxy enable && /etc/init.d/multicast_proxy start"
+            ```
+
+            ### 使用
+
+            ```
+            播放: http://<router_ip>:8888/udp/232.0.1.210:1234
+            状态: http://<router_ip>:8888/status
+            列表: http://<router_ip>:8888/playlist
+            ```
