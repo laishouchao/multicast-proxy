@@ -9,3 +9,7 @@ config proxy 'main'
     option timeout '0'
     option ssm_source ''
     option verbose '0'
+    # 嗅探模式 (自动发现IPTV频道)
+    option sniff_mode '0'
+    # 嗅探接口 (默认使用upstream接口)
+    option mcast_iface ''

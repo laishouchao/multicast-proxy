@@ -13,13 +13,15 @@
  *   - M3U播放列表自动生成
  *   - 智能会话缓存 (断开后短暂保持)
  *   - 带宽监控
+ *   - IGMP 嗅探模式 (自动发现IPTV频道)
+ *   - TS 流频道名解析
  *   - procd/UCI 集成
  *
  * 编译: gcc -O2 -Wall -Wextra -pthread -o multicast_proxy multicast_proxy.c
  * 用法: multicast_proxy [-p port] [-i iface] [-c config] [-d]
  *
  * License: MIT
- * Version: 1.2.0
+ * Version: 1.3.0
  */
 
 #include <stdio.h>
@@ -45,7 +47,7 @@
 #include <pthread.h>
 
 /* ========== 常量 ========== */
-#define VERSION              "1.2.0"
+#define VERSION              "1.3.0"
 #define DEFAULT_PORT         8888
 #define DEFAULT_MAX_CLIENTS  200
 #define DEFAULT_RCVBUF       (1024*1024)
@@ -72,6 +74,9 @@ static struct {
     /* SSM */
     int  ssm;
     char ssm_source[32];
+    /* Sniff mode */
+    int  sniff_mode;
+    char mcast_iface[32];
 } g_cfg = {
     .port = DEFAULT_PORT,
     .iface = "eth0.2",
@@ -84,6 +89,8 @@ static struct {
     .m3u_file = M3U_PATH,
     .ssm = 0,
     .ssm_source = "",
+    .sniff_mode = 0,
+    .mcast_iface = "",
 };
 
 /* ========== 频道 ========== */
@@ -171,6 +178,317 @@ static int html_escape(const char *src, char *dst, int dst_size) {
     }
     dst[o] = 0;
     return o;
+}
+
+/* ========== IGMP 嗅探模块 ========== */
+#define SNIFF_MAX_CHANNELS    256
+#define SNIFF_TS_NAME_LEN    64
+#define SNIFF_SCAN_INTERVAL   60   /* 扫描间隔(秒) */
+#define SNIFF_DATA_TIMEOUT    3    /* 数据接收超时(秒) */
+
+struct discovered_channel {
+    char name[SNIFF_TS_NAME_LEN];
+    char group[32];
+    int  port;
+    int  active;
+    time_t last_seen;
+};
+
+static struct discovered_channel g_discovered[SNIFF_MAX_CHANNELS];
+static int g_discovered_count = 0;
+static pthread_mutex_t g_discovered_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_sniffer_running = 0;
+
+/* IGMPv2 header (RFC 2236) */
+struct igmp_hdr {
+    uint8_t  type;
+    uint8_t  max_resp;
+    uint16_t csum;
+    uint32_t group;
+};
+
+/* IP checksum */
+static uint16_t ip_checksum(const void *buf, int len) {
+    const uint16_t *p = buf;
+    uint32_t sum = 0;
+    while (len > 1) { sum += *p++; len -= 2; }
+    if (len == 1) sum += *(const uint8_t *)p;
+    sum = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* 从 TS 流解析频道名 (PAT→PMT→SDT) */
+static int parse_ts_name(const uint8_t *data, int len, char *name_out, int name_size) {
+    for (int i = 0; i + 188 <= len; i += 188) {
+        const uint8_t *pkt = data + i;
+        if (pkt[0] != 0x47) continue;
+        uint16_t pid = ((pkt[1] & 0x1F) << 8) | pkt[2];
+        if (pid == 0x11) {  /* SDT/BAT */
+            int pl = (pkt[3] & 0x30) == 0x30 ? (pkt[4] + 5) : 4;
+            if (pkt[3] & 0x20) { pl += pkt[pl] + 1; }
+            const uint8_t *sdt = pkt + pl;
+            if (pl + 12 < 188 && sdt[0] == 0x42) {
+                int sdt_len = ((sdt[1] & 0x0F) << 8) | sdt[2];
+                int off = 11;
+                while (off + 5 < sdt_len + 3 && off + 5 < 188 - pl) {
+                    int d_len = ((sdt[off + 3] & 0x0F) << 8) | sdt[off + 4];
+                    if (off + 5 + d_len > 188 - pl) break;
+                    const uint8_t *desc = sdt + off + 5;
+                    if (d_len > 2 && desc[0] == 0x48) {
+                        int nlen = desc[2];
+                        if (3 + nlen < d_len) {
+                            int slen = desc[3 + nlen];
+                            if (4 + nlen + slen <= d_len && slen > 0 && slen < name_size) {
+                                memcpy(name_out, desc + 4 + nlen, slen);
+                                name_out[slen] = 0;
+                                /* 过滤非打印字符 */
+                                for (int k = 0; k < slen; k++) {
+                                    if ((uint8_t)name_out[k] < 0x20 && name_out[k] != 0) {
+                                        memmove(name_out, name_out + k + 1, slen - k);
+                                        break;
+                                    }
+                                }
+                                if (strlen(name_out) > 0) return 0;
+                            }
+                        }
+                    }
+                    off += 5 + d_len;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* IGMP 嗅探线程 */
+static void *igmp_sniffer_thread(void *arg) {
+    (void)arg;
+    const char *iface = strlen(g_cfg.mcast_iface) > 0 ? g_cfg.mcast_iface : g_cfg.iface;
+
+    /* 创建 IGMP 原始 socket */
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
+    if (fd < 0) {
+        logger(0, "[SNIFF] 无法创建 IGMP socket: %s (需要 root 权限)", strerror(errno));
+        return NULL;
+    }
+
+    /* 绑定到指定接口 */
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface);
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
+        logger(0, "[SNIFF] 绑定接口 %s 失败: %s", iface, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+
+    /* 设置接收超时 */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    logger(0, "[SNIFF] IGMP 嗅探已启动 (接口: %s)", iface);
+
+    uint8_t buf[1500];
+    while (g_sniffer_running) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) continue;
+            break;
+        }
+
+        /* 解析 IP 头 */
+        if (n < 28) continue;  /* IP头(20) + IGMP(8) */
+        uint8_t ihl = (buf[0] & 0x0F) * 4;
+        if (ihl < 20 || n < ihl + 8) continue;
+        if (buf[9] != 2) continue;  /* 协议号 2 = IGMP */
+
+        uint32_t src_ip = *(uint32_t *)(buf + 12);
+
+        /* 解析 IGMP 报文 */
+        const struct igmp_hdr *igmp = (const struct igmp_hdr *)(buf + ihl);
+        uint32_t group = ntohl(igmp->group);
+
+        /* 0x16 = Membership Report (IGMPv2 Join) */
+        if (igmp->type == 0x16 && group >= 0xE0000000 && group <= 0xEFFFFFFF) {
+            char gip[32];
+            snprintf(gip, sizeof(gip), "%u.%u.%u.%u",
+                     (group >> 24) & 0xFF, (group >> 16) & 0xFF,
+                     (group >> 8) & 0xFF, group & 0xFF);
+
+            /* 检查是否已发现 */
+            pthread_mutex_lock(&g_discovered_lock);
+            int found = 0;
+            for (int i = 0; i < g_discovered_count; i++) {
+                if (strcmp(g_discovered[i].group, gip) == 0) {
+                    g_discovered[i].last_seen = time(NULL);
+                    g_discovered[i].active = 1;
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found && g_discovered_count < SNIFF_MAX_CHANNELS) {
+                struct discovered_channel *ch = &g_discovered[g_discovered_count];
+                snprintf(ch->group, sizeof(ch->group), "%s", gip);
+                ch->port = 1234;
+                snprintf(ch->name, sizeof(ch->name), "未知_%s:1234", gip);
+                ch->active = 1;
+                ch->last_seen = time(NULL);
+                g_discovered_count++;
+
+                logger(0, "[SNIFF] ★ 发现新频道! 组播组: %s (来自: %s)",
+                       gip, inet_ntoa(*(struct in_addr *)&src_ip));
+            }
+            pthread_mutex_unlock(&g_discovered_lock);
+        }
+    }
+
+    close(fd);
+    logger(0, "[SNIFF] IGMP 嗅探线程已退出");
+    return NULL;
+}
+
+/* 频道扫描验证线程 */
+static void *channel_scanner_thread(void *arg) {
+    (void)arg;
+    logger(0, "[SNIFF] 频道扫描器已启动");
+
+    while (g_sniffer_running) {
+        sleep(SNIFF_SCAN_INTERVAL);
+
+        pthread_mutex_lock(&g_discovered_lock);
+        int count = g_discovered_count;
+        pthread_mutex_unlock(&g_discovered_lock);
+
+        for (int i = 0; i < count && g_sniffer_running; i++) {
+            pthread_mutex_lock(&g_discovered_lock);
+            if (i >= g_discovered_count) { pthread_mutex_unlock(&g_discovered_lock); break; }
+            char gip[32]; int port;
+            snprintf(gip, sizeof(gip), "%s", g_discovered[i].group);
+            port = g_discovered[i].port;
+            pthread_mutex_unlock(&g_discovered_lock);
+
+            /* 尝试加入组播组并接收数据 */
+            int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (fd < 0) continue;
+
+            int reuse = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+            struct sockaddr_in bind_addr = {
+                .sin_family = AF_INET,
+                .sin_port = htons(port),
+                .sin_addr.s_addr = INADDR_ANY,
+            };
+
+            if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+                close(fd);
+                continue;
+            }
+
+            struct ip_mreq mreq;
+            mreq.imr_multiaddr.s_addr = inet_addr(gip);
+
+            /* 获取接口 IP */
+            struct in_addr if_addr;
+            if (get_iface_ip(g_cfg.iface, &if_addr) == 0) {
+                mreq.imr_interface = if_addr;
+            } else {
+                mreq.imr_interface.s_addr = INADDR_ANY;
+            }
+
+            if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+                close(fd);
+                continue;
+            }
+
+            /* 等待数据 */
+            struct timeval tv = { .tv_sec = SNIFF_DATA_TIMEOUT, .tv_usec = 0 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            uint8_t buf[MCAST_BUF_SIZE];
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            close(fd);
+
+            if (n > 0) {
+                /* 成功接收数据 - 频道活跃 */
+                pthread_mutex_lock(&g_discovered_lock);
+                if (i < g_discovered_count) {
+                    g_discovered[i].active = 1;
+                    g_discovered[i].last_seen = time(NULL);
+
+                    /* 尝试从 TS 流解析频道名 */
+                    char ts_name[64];
+                    if (parse_ts_name(buf, n, ts_name, sizeof(ts_name)) == 0) {
+                        snprintf(g_discovered[i].name, sizeof(g_discovered[i].name),
+                                 "%s", ts_name);
+                        logger(0, "[SNIFF] 频道名更新: %s -> %s",
+                               gip, ts_name);
+                    }
+                }
+                pthread_mutex_unlock(&g_discovered_lock);
+            } else {
+                /* 无数据 - 频道不活跃 */
+                pthread_mutex_lock(&g_discovered_lock);
+                if (i < g_discovered_count) {
+                    time_t now = time(NULL);
+                    if (now - g_discovered[i].last_seen > 300) {
+                        g_discovered[i].active = 0;
+                    }
+                }
+                pthread_mutex_unlock(&g_discovered_lock);
+            }
+        }
+
+        /* 自动生成 M3U */
+        pthread_mutex_lock(&g_discovered_lock);
+        if (g_discovered_count > 0) {
+            char m3u_path[512];
+            snprintf(m3u_path, sizeof(m3u_path), "%s.discovered", g_cfg.m3u_file);
+            FILE *f = fopen(m3u_path, "w");
+            if (f) {
+                fprintf(f, "#EXTM3U\n");
+                int active = 0;
+                for (int i = 0; i < g_discovered_count; i++) {
+                    if (g_discovered[i].active) {
+                        fprintf(f, "#EXTINF:-1 tvg-name=\"%s\" group-name=\"嗅探发现\",%s\n",
+                                g_discovered[i].name, g_discovered[i].name);
+                        fprintf(f, "/udp/%s:%d\n", g_discovered[i].group, g_discovered[i].port);
+                        active++;
+                    }
+                }
+                fclose(f);
+                logger(0, "[SNIFF] 已更新播放列表: %d 个活跃频道 -> %s", active, m3u_path);
+            }
+        }
+        pthread_mutex_unlock(&g_discovered_lock);
+    }
+
+    logger(0, "[SNIFF] 频道扫描器已退出");
+    return NULL;
+}
+
+/* 启动嗅探模式 */
+static void start_sniffer(void) {
+    if (!g_cfg.sniff_mode) return;
+
+    g_sniffer_running = 1;
+
+    pthread_t igmp_tid, scan_tid;
+    if (pthread_create(&igmp_tid, NULL, igmp_sniffer_thread, NULL) != 0) {
+        logger(0, "[SNIFF] 创建 IGMP 嗅探线程失败");
+        return;
+    }
+    pthread_detach(igmp_tid);
+
+    if (pthread_create(&scan_tid, NULL, channel_scanner_thread, NULL) != 0) {
+        logger(0, "[SNIFF] 创建频道扫描线程失败");
+        return;
+    }
+    pthread_detach(scan_tid);
+
+    logger(0, "[SNIFF] 嗅探模式已启动");
 }
 
 /* ========== 网络工具 ========== */
@@ -348,6 +666,8 @@ static void load_config(const char *path) {
             }
             else if (strcmp(key, "m3u_file") == 0) snprintf(g_cfg.m3u_file, sizeof(g_cfg.m3u_file), "%s", val);
             else if (strcmp(key, "verbose") == 0) g_cfg.verbose = atoi(val);
+            else if (strcmp(key, "sniff_mode") == 0) g_cfg.sniff_mode = atoi(val);
+            else if (strcmp(key, "mcast_iface") == 0) snprintf(g_cfg.mcast_iface, sizeof(g_cfg.mcast_iface), "%s", val);
         }
     }
     fclose(f);
@@ -358,6 +678,7 @@ struct http_req {
     char method[16], uri[512];
     int is_status, is_playlist, is_api_status, is_api_channels, is_help;
     int is_health;
+    int is_discovered;
     int is_multicast;
     char mcast_addr[32];
     int mcast_port;
@@ -373,6 +694,7 @@ static void parse_http(const char *raw, struct http_req *r) {
              strcmp(r->uri, "/playlist.m3u") == 0 || strcmp(r->uri, "/iptv.m3u") == 0) r->is_playlist = 1;
     else if (strcmp(r->uri, "/api/status") == 0) r->is_api_status = 1;
     else if (strcmp(r->uri, "/api/channels") == 0) r->is_api_channels = 1;
+    else if (strcmp(r->uri, "/discovered") == 0) r->is_discovered = 1;
     else if (strcmp(r->uri, "/health") == 0) r->is_health = 1;
     else {
         const char *p = NULL;
@@ -520,6 +842,31 @@ static void handle_api_channels(int fd) {
         ch = ch->next;
     }
     o += snprintf(buf+o, 64*1024-o, "]");
+    http_send(fd, 200, "application/json", buf, o);
+    free(buf);
+}
+
+static void handle_discovered(int fd) {
+    char *buf = malloc(64 * 1024);
+    if (!buf) { http_send(fd, 500, "text/plain", "OOM", 3); return; }
+
+    pthread_mutex_lock(&g_discovered_lock);
+    int o = snprintf(buf, 64*1024,
+        "{\"count\":%d,\"channels\":[", g_discovered_count);
+    int first = 1;
+    for (int i = 0; i < g_discovered_count; i++) {
+        if (!first) o += snprintf(buf+o, 64*1024-o, ",");
+        o += snprintf(buf+o, 64*1024-o,
+            "{\"name\":\"%s\",\"group\":\"%s\",\"port\":%d,"
+            "\"active\":%d,\"last_seen\":%lld}",
+            g_discovered[i].name, g_discovered[i].group,
+            g_discovered[i].port, g_discovered[i].active,
+            (long long)g_discovered[i].last_seen);
+        first = 0;
+    }
+    o += snprintf(buf+o, 64*1024-o, "]}");
+    pthread_mutex_unlock(&g_discovered_lock);
+
     http_send(fd, 200, "application/json", buf, o);
     free(buf);
 }
@@ -694,6 +1041,7 @@ static void handle_client(int cfd, struct sockaddr_in *ca) {
     if (req.is_playlist) { handle_playlist(cfd); close(cfd); return; }
     if (req.is_api_status) { handle_api_status(cfd); close(cfd); return; }
     if (req.is_api_channels) { handle_api_channels(cfd); close(cfd); return; }
+    if (req.is_discovered) { handle_discovered(cfd); close(cfd); return; }
     if (req.is_health) { handle_health(cfd); close(cfd); return; }
 
     if (req.is_multicast) {
@@ -742,6 +1090,7 @@ static void print_usage(const char *p) {
         "  -C MAX       最大客户端数 (默认: %d)\n"
         "  -t SEC       会话缓存秒数 (默认: %d)\n"
         "  -s SOURCE    SSM源地址\n"
+        "  -S           嗅探模式 (自动发现IPTV频道)\n"
         "  -d           守护进程模式\n"
         "  -v           详细日志\n"
         "  -h           帮助\n\n"
@@ -762,7 +1111,7 @@ int main(int argc, char *argv[]) {
     int opt;
     char channel_file[256] = "";
 
-    while ((opt = getopt(argc, argv, "p:i:c:f:C:t:s:dvh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:i:c:f:C:t:s:Sdvh")) != -1) {
         switch (opt) {
             case 'p': g_cfg.port = atoi(optarg); break;
             case 'i': snprintf(g_cfg.iface, sizeof(g_cfg.iface), "%s", optarg); break;
@@ -771,6 +1120,7 @@ int main(int argc, char *argv[]) {
             case 'C': g_cfg.max_clients = atoi(optarg); break;
             case 't': g_cfg.grace_sec = atoi(optarg); break;
             case 's': snprintf(g_cfg.ssm_source, sizeof(g_cfg.ssm_source), "%s", optarg); g_cfg.ssm = 1; break;
+            case 'S': g_cfg.sniff_mode = 1; break;
             case 'd': g_cfg.daemon = 1; break;
             case 'v': g_cfg.verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -801,6 +1151,12 @@ int main(int argc, char *argv[]) {
     LOGI("Port: %d, Interface: %s, Max clients: %d, Channels: %d",
          g_cfg.port, g_cfg.iface, g_cfg.max_clients, g_channel_count);
     if (g_cfg.ssm) LOGI("SSM source: %s", g_cfg.ssm_source);
+
+    /* 启动嗅探模式 */
+    if (g_cfg.sniff_mode) {
+        start_sniffer();
+        LOGI("Sniff mode enabled - 自动发现IPTV频道");
+    }
 
     /* 检查接口 */
     struct in_addr ifip;
