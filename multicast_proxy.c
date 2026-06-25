@@ -355,6 +355,7 @@ static void load_config(const char *path) {
 struct http_req {
     char method[16], uri[512];
     int is_status, is_playlist, is_api_status, is_api_channels, is_help;
+    int is_health;
     int is_multicast;
     char mcast_addr[32];
     int mcast_port;
@@ -370,6 +371,7 @@ static void parse_http(const char *raw, struct http_req *r) {
              strcmp(r->uri, "/playlist.m3u") == 0 || strcmp(r->uri, "/iptv.m3u") == 0) r->is_playlist = 1;
     else if (strcmp(r->uri, "/api/status") == 0) r->is_api_status = 1;
     else if (strcmp(r->uri, "/api/channels") == 0) r->is_api_channels = 1;
+    else if (strcmp(r->uri, "/health") == 0) r->is_health = 1;
     else {
         const char *p = NULL;
         if (strncmp(r->uri, "/udp/", 5) == 0 || strncmp(r->uri, "/rtp/", 5) == 0)
