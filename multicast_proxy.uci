@@ -1,0 +1,11 @@
+# UCI配置: /etc/config/multicast_proxy
+# multicast_proxy - All-in-One IPTV Proxy
+
+config proxy 'main'
+    option enabled '1'
+    option port '8888'
+    option upstream 'eth0.2'
+    option max_clients '100'
+    option timeout '0'
+    option ssm_source ''
+    option verbose '0'

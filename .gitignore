@@ -1,0 +1,17 @@
+# Build artifacts
+multicast_proxy
+*.o
+*.tar.gz
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+package-lock.json
