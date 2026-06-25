@@ -54,8 +54,12 @@ uninstall:
 	rm -f $(BINDIR)/$(TARGET)
 
 # 交叉编译示例 (需要OpenWrt SDK)
-# make CROSS_COMPILE=/path/to/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-5.4.0_musl-1.1.16/bin/mipsel-openwrt-linux-musl-
-# make CROSS_COMPILE=/path/to/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-5.4.0_musl-1.1.16/bin/mipsel-openwrt-linux-musl- strip
+# LEDE 17.01.7 (WR1200JS / MT7621):
+#   SDK: https://archive.openwrt.org/releases/17.01.7/targets/ramips/mt7621/lede-sdk-17.01.7-ramips-mt7621_gcc-5.4.0_musl-1.1.16.Linux-x86_64.tar.xz
+#   make CROSS_COMPILE=mipsel-openwrt-linux-musl- LDFLAGS="-pthread -static"
+#
+# OpenWrt 21.02+:
+#   make CROSS_COMPILE=mipsel-openwrt-linux-musl- LDFLAGS="-pthread -static"
 
 # 在路由器上本地编译
 # make CC=gcc

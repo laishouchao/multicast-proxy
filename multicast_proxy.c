@@ -19,7 +19,7 @@
  * 用法: multicast_proxy [-p port] [-i iface] [-c config] [-d]
  *
  * License: MIT
- * Version: 1.1.1
+ * Version: 1.2.0
  */
 
 #include <stdio.h>
@@ -45,7 +45,7 @@
 #include <pthread.h>
 
 /* ========== 常量 ========== */
-#define VERSION              "1.1.1"
+#define VERSION              "1.2.0"
 #define DEFAULT_PORT         8888
 #define DEFAULT_MAX_CLIENTS  200
 #define DEFAULT_RCVBUF       (1024*1024)
@@ -212,11 +212,11 @@ static struct channel_entry *channel_add(const char *name, const char *group,
     if (channel_find(addr, port)) return channel_find(addr, port);
     struct channel_entry *ch = calloc(1, sizeof(*ch));
     if (!ch) return NULL;
-    strncpy(ch->name, name ? name : "", sizeof(ch->name)-1);
-    strncpy(ch->group, group ? group : "未分组", sizeof(ch->group)-1);
-    strncpy(ch->addr, addr, sizeof(ch->addr)-1);
+    snprintf(ch->name, sizeof(ch->name), "%s", name ? name : "");
+    snprintf(ch->group, sizeof(ch->group), "%s", group ? group : "未分组");
+    snprintf(ch->addr, sizeof(ch->addr), "%s", addr);
     ch->port = port;
-    strncpy(ch->logo, logo ? logo : "", sizeof(ch->logo)-1);
+    snprintf(ch->logo, sizeof(ch->logo), "%s", logo ? logo : "");
     ch->next = g_channels;
     g_channels = ch;
     g_channel_count++;
@@ -243,19 +243,19 @@ static void load_channels_from_file(const char *path) {
         if (strncmp(line, "#EXTINF:", 8) == 0) {
             /* 解析EXTINF行，下一行是URL */
             char *comma = strrchr(line, ',');
-            if (comma) strncpy(name, comma+1, sizeof(name)-1);
+            if (comma) snprintf(name, sizeof(name), "%s", comma+1);
             /* 提取tvg-name和group-name */
             char *tvg = strstr(line, "tvg-name=\"");
             if (tvg) {
                 tvg += 10;
                 char *end = strchr(tvg, '"');
-                if (end) { int len = end-tvg; if (len>127) len=127; strncpy(name, tvg, len); name[len]=0; }
+                if (end) { int len = end-tvg; if (len>127) len=127; memcpy(name, tvg, len); name[len]=0; }
             }
             char *grp = strstr(line, "group-name=\"");
             if (grp) {
                 grp += 12;
                 char *end = strchr(grp, '"');
-                if (end) { int len = end-grp; if (len>63) len=63; strncpy(group, grp, len); group[len]=0; }
+                if (end) { int len = end-grp; if (len>63) len=63; memcpy(group, grp, len); group[len]=0; }
             }
             /* 读下一行获取URL */
             if (fgets(line, sizeof(line), f)) {
@@ -765,12 +765,12 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt(argc, argv, "p:i:c:f:C:t:s:dvh")) != -1) {
         switch (opt) {
             case 'p': g_cfg.port = atoi(optarg); break;
-            case 'i': strncpy(g_cfg.iface, optarg, sizeof(g_cfg.iface)-1); break;
-            case 'c': strncpy(g_cfg.config_file, optarg, sizeof(g_cfg.config_file)-1); break;
-            case 'f': strncpy(channel_file, optarg, sizeof(channel_file)-1); break;
+            case 'i': snprintf(g_cfg.iface, sizeof(g_cfg.iface), "%s", optarg); break;
+            case 'c': snprintf(g_cfg.config_file, sizeof(g_cfg.config_file), "%s", optarg); break;
+            case 'f': snprintf(channel_file, sizeof(channel_file), "%s", optarg); break;
             case 'C': g_cfg.max_clients = atoi(optarg); break;
             case 't': g_cfg.grace_sec = atoi(optarg); break;
-            case 's': strncpy(g_cfg.ssm_source, optarg, sizeof(g_cfg.ssm_source)-1); g_cfg.ssm = 1; break;
+            case 's': snprintf(g_cfg.ssm_source, sizeof(g_cfg.ssm_source), "%s", optarg); g_cfg.ssm = 1; break;
             case 'd': g_cfg.daemon = 1; break;
             case 'v': g_cfg.verbose = 1; break;
             case 'h': print_usage(argv[0]); return 0;
