@@ -179,7 +179,9 @@ static int get_iface_ip(const char *iface, struct in_addr *addr) {
     if (fd < 0) return -1;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+    size_t len = strlen(iface);
+    if (len >= IFNAMSIZ) len = IFNAMSIZ - 1;
+    memcpy(ifr.ifr_name, iface, len);
     int ret = ioctl(fd, SIOCGIFADDR, &ifr);
     close(fd);
     if (ret < 0) return -1;
@@ -336,15 +338,15 @@ static void load_config(const char *path) {
         char key[64], val[256];
         if (sscanf(line, "%63[^=]=%255s", key, val) == 2) {
             if (strcmp(key, "port") == 0) g_cfg.port = atoi(val);
-            else if (strcmp(key, "iface") == 0) strncpy(g_cfg.iface, val, sizeof(g_cfg.iface)-1);
+            else if (strcmp(key, "iface") == 0) snprintf(g_cfg.iface, sizeof(g_cfg.iface), "%s", val);
             else if (strcmp(key, "max_clients") == 0) g_cfg.max_clients = atoi(val);
             else if (strcmp(key, "rcvbuf") == 0) g_cfg.rcvbuf = atoi(val);
             else if (strcmp(key, "grace_sec") == 0) g_cfg.grace_sec = atoi(val);
             else if (strcmp(key, "ssm_source") == 0 && val[0]) {
                 g_cfg.ssm = 1;
-                strncpy(g_cfg.ssm_source, val, sizeof(g_cfg.ssm_source)-1);
+                snprintf(g_cfg.ssm_source, sizeof(g_cfg.ssm_source), "%s", val);
             }
-            else if (strcmp(key, "m3u_file") == 0) strncpy(g_cfg.m3u_file, val, sizeof(g_cfg.m3u_file)-1);
+            else if (strcmp(key, "m3u_file") == 0) snprintf(g_cfg.m3u_file, sizeof(g_cfg.m3u_file), "%s", val);
             else if (strcmp(key, "verbose") == 0) g_cfg.verbose = atoi(val);
         }
     }
