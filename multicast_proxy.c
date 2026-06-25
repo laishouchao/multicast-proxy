@@ -181,6 +181,10 @@ static int html_escape(const char *src, char *dst, int dst_size) {
 }
 
 /* ========== IGMP 嗅探模块 ========== */
+
+/* 前向声明 (嗅探模块在网络工具函数之前定义) */
+static int get_iface_ip(const char *iface, struct in_addr *addr);
+
 #define SNIFF_MAX_CHANNELS    256
 #define SNIFF_TS_NAME_LEN    64
 #define SNIFF_SCAN_INTERVAL   60   /* 扫描间隔(秒) */
@@ -206,17 +210,6 @@ struct igmp_hdr {
     uint16_t csum;
     uint32_t group;
 };
-
-/* IP checksum */
-static uint16_t ip_checksum(const void *buf, int len) {
-    const uint16_t *p = buf;
-    uint32_t sum = 0;
-    while (len > 1) { sum += *p++; len -= 2; }
-    if (len == 1) sum += *(const uint8_t *)p;
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
-    return (uint16_t)~sum;
-}
 
 /* 从 TS 流解析频道名 (PAT→PMT→SDT) */
 static int parse_ts_name(const uint8_t *data, int len, char *name_out, int name_size) {
@@ -269,7 +262,7 @@ static void *igmp_sniffer_thread(void *arg) {
     /* 创建 IGMP 原始 socket */
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
     if (fd < 0) {
-        logger(0, "[SNIFF] 无法创建 IGMP socket: %s (需要 root 权限)", strerror(errno));
+        LOGE("[SNIFF] 无法创建 IGMP socket: %s (需要 root 权限)", strerror(errno));
         return NULL;
     }
 
@@ -278,7 +271,7 @@ static void *igmp_sniffer_thread(void *arg) {
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", iface);
     if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
-        logger(0, "[SNIFF] 绑定接口 %s 失败: %s", iface, strerror(errno));
+        LOGE("[SNIFF] 绑定接口 %s 失败: %s", iface, strerror(errno));
         close(fd);
         return NULL;
     }
@@ -287,7 +280,7 @@ static void *igmp_sniffer_thread(void *arg) {
     struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    logger(0, "[SNIFF] IGMP 嗅探已启动 (接口: %s)", iface);
+    LOGI("[SNIFF] IGMP 嗅探已启动 (接口: %s)", iface);
 
     uint8_t buf[1500];
     while (g_sniffer_running) {
@@ -337,7 +330,7 @@ static void *igmp_sniffer_thread(void *arg) {
                 ch->last_seen = time(NULL);
                 g_discovered_count++;
 
-                logger(0, "[SNIFF] ★ 发现新频道! 组播组: %s (来自: %s)",
+                LOGI("[SNIFF] ★ 发现新频道! 组播组: %s (来自: %s)",
                        gip, inet_ntoa(*(struct in_addr *)&src_ip));
             }
             pthread_mutex_unlock(&g_discovered_lock);
@@ -345,14 +338,14 @@ static void *igmp_sniffer_thread(void *arg) {
     }
 
     close(fd);
-    logger(0, "[SNIFF] IGMP 嗅探线程已退出");
+    LOGI("[SNIFF] IGMP 嗅探线程已退出");
     return NULL;
 }
 
 /* 频道扫描验证线程 */
 static void *channel_scanner_thread(void *arg) {
     (void)arg;
-    logger(0, "[SNIFF] 频道扫描器已启动");
+    LOGI("[SNIFF] 频道扫描器已启动");
 
     while (g_sniffer_running) {
         sleep(SNIFF_SCAN_INTERVAL);
@@ -423,7 +416,7 @@ static void *channel_scanner_thread(void *arg) {
                     if (parse_ts_name(buf, n, ts_name, sizeof(ts_name)) == 0) {
                         snprintf(g_discovered[i].name, sizeof(g_discovered[i].name),
                                  "%s", ts_name);
-                        logger(0, "[SNIFF] 频道名更新: %s -> %s",
+                        LOGI("[SNIFF] 频道名更新: %s -> %s",
                                gip, ts_name);
                     }
                 }
@@ -459,13 +452,13 @@ static void *channel_scanner_thread(void *arg) {
                     }
                 }
                 fclose(f);
-                logger(0, "[SNIFF] 已更新播放列表: %d 个活跃频道 -> %s", active, m3u_path);
+                LOGI("[SNIFF] 已更新播放列表: %d 个活跃频道 -> %s", active, m3u_path);
             }
         }
         pthread_mutex_unlock(&g_discovered_lock);
     }
 
-    logger(0, "[SNIFF] 频道扫描器已退出");
+    LOGI("[SNIFF] 频道扫描器已退出");
     return NULL;
 }
 
@@ -477,18 +470,18 @@ static void start_sniffer(void) {
 
     pthread_t igmp_tid, scan_tid;
     if (pthread_create(&igmp_tid, NULL, igmp_sniffer_thread, NULL) != 0) {
-        logger(0, "[SNIFF] 创建 IGMP 嗅探线程失败");
+        LOGE("[SNIFF] 创建 IGMP 嗅探线程失败");
         return;
     }
     pthread_detach(igmp_tid);
 
     if (pthread_create(&scan_tid, NULL, channel_scanner_thread, NULL) != 0) {
-        logger(0, "[SNIFF] 创建频道扫描线程失败");
+        LOGE("[SNIFF] 创建频道扫描线程失败");
         return;
     }
     pthread_detach(scan_tid);
 
-    logger(0, "[SNIFF] 嗅探模式已启动");
+    LOGI("[SNIFF] 嗅探模式已启动");
 }
 
 /* ========== 网络工具 ========== */
