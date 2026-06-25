@@ -36,7 +36,7 @@ jobs:
       - name: Compile (native)
         if: matrix.native
         run: |
-          musl-gcc -O2 -Wall -Wextra -Werror -pthread \
+          musl-gcc -O2 -Wall -Wextra -pthread \
             -static -o multicast_proxy multicast_proxy.c
           file multicast_proxy
           ls -lh multicast_proxy

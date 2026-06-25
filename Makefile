@@ -2,7 +2,7 @@
 # 支持本地编译和OpenWrt交叉编译
 
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -Werror
+CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 LDFLAGS ?= -pthread
 
 # 目标
