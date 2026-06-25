@@ -109,7 +109,9 @@ static volatile int g_running = 1;
 static volatile int g_child_count = 0;
 static volatile int g_total_clients = 0;
 static volatile int g_active_clients = 0;
+/* g_stats_lock - 如需线程安全可取消注释
 static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+*/
 
 static void sig_handler(int sig) {
     if (sig == SIGCHLD) {
@@ -185,10 +187,12 @@ static int get_iface_ip(const char *iface, struct in_addr *addr) {
     return 0;
 }
 
+/* set_nonblock - 如需非阻塞模式可取消注释
 static void set_nonblock(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+*/
 
 /* ========== 频道管理 ========== */
 
