@@ -15,10 +15,11 @@
  *   - 带宽监控
  *   - procd/UCI 集成
  *
- * 编译: gcc -O2 -Wall -pthread -o multicast_proxy multicast_proxy.c
+ * 编译: gcc -O2 -Wall -Wextra -pthread -o multicast_proxy multicast_proxy.c
  * 用法: multicast_proxy [-p port] [-i iface] [-c config] [-d]
  *
  * License: MIT
+ * Version: 1.1.1
  */
 
 #include <stdio.h>
@@ -35,6 +36,7 @@
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -43,7 +45,7 @@
 #include <pthread.h>
 
 /* ========== 常量 ========== */
-#define VERSION              "1.1.0"
+#define VERSION              "1.1.1"
 #define DEFAULT_PORT         8888
 #define DEFAULT_MAX_CLIENTS  200
 #define DEFAULT_RCVBUF       (1024*1024)
@@ -151,6 +153,23 @@ static void log_msg(int level, const char *fmt, ...) {
 #define LOGI(fmt, ...) log_msg(1, fmt, ##__VA_ARGS__)
 #define LOGW(fmt, ...) log_msg(2, fmt, ##__VA_ARGS__)
 #define LOGE(fmt, ...) log_msg(3, fmt, ##__VA_ARGS__)
+
+/* ========== HTML安全 ========== */
+static int html_escape(const char *src, char *dst, int dst_size) {
+    int o = 0;
+    for (const char *p = src; *p && o < dst_size - 5; p++) {
+        switch (*p) {
+            case '&':  o += snprintf(dst+o, dst_size-o, "&amp;");  break;
+            case '<':  o += snprintf(dst+o, dst_size-o, "&lt;");   break;
+            case '>':  o += snprintf(dst+o, dst_size-o, "&gt;");   break;
+            case '"':  o += snprintf(dst+o, dst_size-o, "&quot;"); break;
+            case '\'': o += snprintf(dst+o, dst_size-o, "&#39;");  break;
+            default:   dst[o++] = *p; break;
+        }
+    }
+    dst[o] = 0;
+    return o;
+}
 
 /* ========== 网络工具 ========== */
 static int get_iface_ip(const char *iface, struct in_addr *addr) {
@@ -434,12 +453,16 @@ static void handle_status(int fd) {
 
     struct channel_entry *ch = g_channels;
     while (ch) {
+        char esc_name[256], esc_group[128], esc_addr[64];
+        html_escape(ch->name, esc_name, sizeof(esc_name));
+        html_escape(ch->group, esc_group, sizeof(esc_group));
+        html_escape(ch->addr, esc_addr, sizeof(esc_addr));
         o += snprintf(buf+o, sizeof(buf)-o,
             "<tr><td class='ch-name'>%s</td><td>%s</td>"
             "<td class='ch-addr'>%s:%d</td>"
             "<td class='listeners'>%d</td>"
             "<td><a href='/udp/%s:%d'>Play</a></td></tr>",
-            ch->name, ch->group, ch->addr, ch->port,
+            esc_name, esc_group, esc_addr, ch->port,
             ch->listeners, ch->addr, ch->port);
         ch = ch->next;
     }
@@ -506,22 +529,21 @@ static void handle_playlist(int fd) {
         fclose(f);
     } else {
         /* 动态生成 */
+        char proxy_host[64] = "127.0.0.1";
+        /* 尝试获取本机IP */
+        struct in_addr local_ip;
+        if (get_iface_ip(g_cfg.iface, &local_ip) == 0)
+            inet_ntop(AF_INET, &local_ip, proxy_host, sizeof(proxy_host));
+
         o += snprintf(buf+o, 128*1024-o, "#EXTM3U\n");
         struct channel_entry *ch = g_channels;
         while (ch) {
             o += snprintf(buf+o, 128*1024-o,
                 "#EXTINF:-1 tvg-name=\"%s\" tvg-logo=\"%s\" group-name=\"%s\",%s\n"
-                "http://%%s:%d/udp/%s:%d\n",
+                "http://%s:%d/udp/%s:%d\n",
                 ch->name, ch->logo, ch->group, ch->name,
-                g_cfg.port, ch->addr, ch->port);
+                proxy_host, g_cfg.port, ch->addr, ch->port);
             ch = ch->next;
-        }
-        /* 替换 %s 为实际IP (简化: 用127.0.0.1) */
-        char *pos = buf;
-        while ((pos = strstr(pos, "%s")) != NULL) {
-            memmove(pos+9, pos+2, strlen(pos+2)+1);
-            memcpy(pos, "127.0.0.1", 9);
-            pos += 9;
         }
     }
 
@@ -583,13 +605,7 @@ static void child_stream(int client_fd, const char *addr, int port,
         setsockopt(mfd, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &mrs, sizeof(mrs));
     }
 
-    /* 更新频道统计 */
-    struct channel_entry *ch = channel_find(addr, port);
-    if (ch) {
-        __sync_fetch_and_add(&ch->listeners, 1);
-        ch->active = 1;
-        ch->last_active = time(NULL);
-    }
+    /* 注意: 子进程中的 channel_find 仅用于日志，不修改父进程状态 */
 
     LOGI("Stream start: %s:%d -> %s:%d", addr, port, client_ip, client_port);
 
@@ -625,16 +641,8 @@ static void child_stream(int client_fd, const char *addr, int port,
     }
 
     /* 清理 */
-    setsockopt(mfd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
     close(mfd);
     close(client_fd);
-
-    if (ch) {
-        __sync_fetch_and_sub(&ch->listeners, 1);
-        ch->bytes_tx += tx_bytes;
-        ch->last_active = time(NULL);
-        if (ch->listeners <= 0) ch->active = 0;
-    }
 
     LOGI("Stream end: %s:%d (%.1f MB sent)", addr, port, tx_bytes/1048576.0);
     _exit(0);

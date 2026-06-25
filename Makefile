@@ -2,8 +2,8 @@
 # 支持本地编译和OpenWrt交叉编译
 
 CC ?= gcc
-CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
-LDFLAGS ?=
+CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -Werror
+LDFLAGS ?= -pthread
 
 # 目标
 TARGET = multicast_proxy
@@ -28,9 +28,12 @@ else
     STRIP = strip
 endif
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install uninstall static
 
 all: $(TARGET)
+
+static: LDFLAGS += -static
+static: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
